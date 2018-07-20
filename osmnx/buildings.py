@@ -502,30 +502,6 @@ def buildings_from_place(place, search_term='', retain_invalid=False):
                                           retain_invalid=retain_invalid)
 
 
-# def named_buildings_from_place(place, search_term='', retain_invalid=False):
-#     """
-#     Get building footprints within the boundaries of some place.
-#
-#     Parameters
-#     ----------
-#     place : string
-#         the query to geocode to get geojson boundary polygon
-#     retain_invalid : bool
-#         if False discard any building footprints with an invalid geometry
-#     search_term : str
-#         regex search term used to find the name of the building (e.g. Starbucks)
-#
-#     Returns
-#     -------
-#     GeoDataFrame
-#     """
-#
-#     city = gdf_from_place(place)
-#     polygon = city['geometry'].iloc[0]
-#     return create_named_buildings_gdf(polygon, search_term=search_term,
-#                                       retain_invalid=retain_invalid)
-
-
 def plot_buildings(gdf, fig=None, ax=None, figsize=None, color='#333333', bgcolor='w', set_bounds=True, bbox=None,
                    save=False, show=True, close=False, filename='image', file_format='png', dpi=600):
     """
