@@ -9,6 +9,7 @@ import time
 import geopandas as gpd
 import matplotlib.pyplot as plt
 from matplotlib.collections import PatchCollection
+from shapely.geometry import Point
 from shapely.geometry import Polygon
 from shapely.geometry import MultiPolygon
 from descartes import PolygonPatch
@@ -133,6 +134,140 @@ def osm_bldg_download(polygon=None, north=None, south=None, east=None, west=None
     return response_jsons
 
 
+def osm_bldg_download_by_name(polygon=None, north=None, south=None, east=None, west=None,
+                      timeout=180, memory=None, max_query_area_size=50*1000*50*1000,
+                      search_term=''):
+    """
+    Download OpenStreetMap building footprint data.
+
+    Parameters
+    ----------
+    polygon : shapely Polygon or MultiPolygon
+        geographic shape to fetch the building footprints within
+    north : float
+        northern latitude of bounding box
+    south : float
+        southern latitude of bounding box
+    east : float
+        eastern longitude of bounding box
+    west : float
+        western longitude of bounding box
+    timeout : int
+        the timeout interval for requests and to pass to API
+    memory : int
+        server memory allocation size for the query, in bytes. If none, server
+        will use its default allocation size
+    max_query_area_size : float
+        max area for any part of the geometry, in the units the geometry is in:
+        any polygon bigger will get divided up for multiple queries to API
+        (default is 50,000 * 50,000 units (ie, 50km x 50km in area, if units are
+        meters))
+    search_term : str
+        regex search term used to find the name of the building (e.g. Starbucks)
+
+    Returns
+    -------
+    list
+        list of response_json dicts
+    """
+
+    # check if we're querying by polygon or by bounding box based on which
+    # argument(s) where passed into this function
+    by_poly = polygon is not None
+    by_bbox = not (north is None or south is None or east is None or west is None)
+    if not (by_poly or by_bbox):
+        raise ValueError('You must pass a polygon or north, south, east, and west')
+
+    response_jsons = []
+
+    # pass server memory allocation in bytes for the query to the API
+    # if None, pass nothing so the server will use its default allocation size
+    # otherwise, define the query's maxsize parameter value as whatever the
+    # caller passed in
+    if memory is None:
+        maxsize = ''
+    else:
+        maxsize = '[maxsize:{}]'.format(memory)
+
+    # define the query to send the API
+    if by_bbox:
+        # turn bbox into a polygon and project to local UTM
+        polygon = Polygon([(west, south), (east, south), (east, north), (west, north)])
+        geometry_proj, crs_proj = project_geometry(polygon)
+
+        # subdivide it if it exceeds the max area size (in meters), then project
+        # back to lat-long
+        geometry_proj_consolidated_subdivided = consolidate_subdivide_geometry(geometry_proj, max_query_area_size=max_query_area_size)
+        geometry, _ = project_geometry(geometry_proj_consolidated_subdivided, crs=crs_proj, to_latlong=True)
+        log('Requesting building footprints data within bounding box from API in {:,} request(s)'.format(len(geometry)))
+        start_time = time.time()
+
+        # loop through each polygon rectangle in the geometry (there will only
+        # be one if original bbox didn't exceed max area size)
+        for poly in geometry:
+            # represent bbox as south,west,north,east and round lat-longs to 8
+            # decimal places (ie, within 1 mm) so URL strings aren't different
+            # due to float rounding issues (for consistent caching)
+            west, south, east, north = poly.bounds
+            bounding_box = ('{south:.8f},{west:.8f},{north:.8f},{east:.8f}').format(north=north, south=south, east=east, west=west)
+
+            query_template = (
+                '[out:json][timeout:{timeout}]{maxsize};'
+                '('
+                'node["name"~"{search_term}", i]({bounding_box});'
+                'way["name"~"{search_term}", i][!"highway"]({bounding_box});'
+                'relation["name"~"{search_term}", i]({bounding_box});'
+                ');'
+                'out count;'
+                # 'out;'
+                'out body;'
+                '>;'
+                'out skel qt;'
+            )
+            query_str = query_template.format(timeout=timeout, maxsize=maxsize, search_term=search_term, bounding_box=bounding_box)
+
+            response_json = overpass_request(data={'data':query_str}, timeout=timeout)
+            response_jsons.append(response_json)
+        msg = ('Got all building footprints data within bounding box from '
+               'API in {:,} request(s) and {:,.2f} seconds')
+        log(msg.format(len(geometry), time.time()-start_time))
+
+    elif by_poly:
+        # project to utm, divide polygon up into sub-polygons if area exceeds a
+        # max size (in meters), project back to lat-long, then get a list of polygon(s) exterior coordinates
+        geometry_proj, crs_proj = project_geometry(polygon)
+        geometry_proj_consolidated_subdivided = consolidate_subdivide_geometry(geometry_proj, max_query_area_size=max_query_area_size)
+        geometry, _ = project_geometry(geometry_proj_consolidated_subdivided, crs=crs_proj, to_latlong=True)
+        polygon_coord_strs = get_polygons_coordinates(geometry)
+        log('Requesting building footprints data within polygon from API in {:,} request(s)'.format(len(polygon_coord_strs)))
+        start_time = time.time()
+
+        # pass each polygon exterior coordinates in the list to the API, one at
+        # a time
+        for polygon_coord_str in polygon_coord_strs:
+            # query_template = ('[out:json][timeout:{timeout}]{maxsize};(way'
+            #                   '(poly:"{polygon}")["building"];(._;>;);relation'
+            #                   '(poly:"{polygon}")["building"];(._;>;););out;')
+            query_template = (
+                '[out:json][timeout:{timeout}]{maxsize};'
+                '('
+                'node(poly:"{polygon}")["building"];(._;>;);'
+                'way(poly:"{polygon}")["building"];(._;>;);'
+                'relation(poly:"{polygon}")["building"];(._;>;);'
+                ');'
+                'out count;'
+                'out;'
+            )
+            query_str = query_template.format(polygon=polygon_coord_str, timeout=timeout, maxsize=maxsize)
+            response_json = overpass_request(data={'data':query_str}, timeout=timeout)
+            response_jsons.append(response_json)
+        msg = ('Got all building footprints data within polygon from API in '
+               '{:,} request(s) and {:,.2f} seconds')
+        log(msg.format(len(polygon_coord_strs), time.time()-start_time))
+
+    return response_jsons
+
+
 def create_buildings_gdf(polygon=None, north=None, south=None, east=None,
                          west=None, retain_invalid=False):
     """
@@ -178,6 +313,78 @@ def create_buildings_gdf(polygon=None, north=None, south=None, east=None,
                     log('Polygon has invalid geometry: {}'.format(nodes))
                 building = {'nodes' : nodes,
                             'geometry' : polygon}
+
+                if 'tags' in result:
+                    for tag in result['tags']:
+                        building[tag] = result['tags'][tag]
+
+                buildings[result['id']] = building
+
+    gdf = gpd.GeoDataFrame(buildings).T
+    gdf.crs = settings.default_crs
+
+    if not retain_invalid:
+        # drop all invalid geometries
+        gdf = gdf[gdf['geometry'].is_valid]
+
+    return gdf
+
+
+def create_named_buildings_gdf(polygon=None, north=None, south=None, east=None,
+                               west=None, search_term='', retain_invalid=False):
+    """
+    Get building footprint data from OSM then assemble it into a GeoDataFrame.
+
+    Parameters
+    ----------
+    polygon : shapely Polygon or MultiPolygon
+        geographic shape to fetch the building footprints within
+    north : float
+        northern latitude of bounding box
+    south : float
+        southern latitude of bounding box
+    east : float
+        eastern longitude  of bounding box
+    west : float
+        western longitude of bounding box
+    search_term : str
+        regex search term used to find the name of the building (e.g. Starbucks)
+    retain_invalid : bool
+        if False discard any building footprints with an invalid geometry
+
+    Returns
+    -------
+    GeoDataFrame
+    """
+
+    responses = osm_bldg_download_by_name(polygon, north, south, east, west,
+                                          search_term=search_term)
+
+    vertices = {}
+    buildings = {}
+    for response in responses:
+        for result in response['elements']:
+            if 'type' in result and result['type']=='node':
+                if 'tags' in result:
+                    building = {'geometry': Point(result['lon'], result['lat'])}
+                    building.update(result['tags'])
+                    building.update({'search_term' : search_term})
+                    buildings[result['id']] = building
+                else:
+                    vertices[result['id']] = {'lat' : result['lat'],
+                                              'lon' : result['lon']}
+
+    for response in responses:
+        for result in response['elements']:
+            if 'type' in result and result['type']=='way':
+                nodes = result['nodes']
+                try:
+                    polygon = Polygon([(vertices[node]['lon'], vertices[node]['lat']) for node in nodes])
+                except Exception as e:
+                    log('Polygon has invalid geometry: {}'.format(nodes))
+                building = {'nodes' : nodes,
+                            'geometry' : polygon.centroid,
+                            'search_term' : search_term}
 
                 if 'tags' in result:
                     for tag in result['tags']:
@@ -261,10 +468,11 @@ def buildings_from_polygon(polygon, retain_invalid=False):
     GeoDataFrame
     """
 
-    return create_buildings_gdf(polygon=polygon, retain_invalid=retain_invalid)
+    return create_buildings_gdf(polygon=polygon, search_term=search_term,
+                                retain_invalid=retain_invalid)
 
 
-def buildings_from_place(place, retain_invalid=False):
+def buildings_from_place(place, search_term='', retain_invalid=False):
     """
     Get building footprints within the boundaries of some place.
 
@@ -272,6 +480,10 @@ def buildings_from_place(place, retain_invalid=False):
     ----------
     place : string
         the query to geocode to get geojson boundary polygon
+    search_term : str
+        regex search term used to find the name of the building (e.g. Starbucks)
+        if left as an empty string, the query will download all buildings (will
+        call osm_bldg_download instead of osm_bldg_download_by_name)
     retain_invalid : bool
         if False discard any building footprints with an invalid geometry
 
@@ -282,7 +494,36 @@ def buildings_from_place(place, retain_invalid=False):
 
     city = gdf_from_place(place)
     polygon = city['geometry'].iloc[0]
-    return create_buildings_gdf(polygon, retain_invalid=retain_invalid)
+
+    if not search_term:
+        return create_buildings_gdf(polygon, retain_invalid=retain_invalid)
+    else:
+        return create_named_buildings_gdf(polygon, search_term=search_term,
+                                          retain_invalid=retain_invalid)
+
+
+# def named_buildings_from_place(place, search_term='', retain_invalid=False):
+#     """
+#     Get building footprints within the boundaries of some place.
+#
+#     Parameters
+#     ----------
+#     place : string
+#         the query to geocode to get geojson boundary polygon
+#     retain_invalid : bool
+#         if False discard any building footprints with an invalid geometry
+#     search_term : str
+#         regex search term used to find the name of the building (e.g. Starbucks)
+#
+#     Returns
+#     -------
+#     GeoDataFrame
+#     """
+#
+#     city = gdf_from_place(place)
+#     polygon = city['geometry'].iloc[0]
+#     return create_named_buildings_gdf(polygon, search_term=search_term,
+#                                       retain_invalid=retain_invalid)
 
 
 def plot_buildings(gdf, fig=None, ax=None, figsize=None, color='#333333', bgcolor='w', set_bounds=True, bbox=None,
