@@ -5,6 +5,7 @@
 # Web: https://github.com/gboeing/osmnx
 ################################################################################
 
+import re
 import time
 import geopandas as gpd
 import matplotlib.pyplot as plt
@@ -251,14 +252,14 @@ def osm_bldg_download_by_name(polygon=None, north=None, south=None, east=None, w
             query_template = (
                 '[out:json][timeout:{timeout}]{maxsize};'
                 '('
-                'node(poly:"{polygon}")["building"];(._;>;);'
-                'way(poly:"{polygon}")["building"];(._;>;);'
-                'relation(poly:"{polygon}")["building"];(._;>;);'
+                'node(poly:"{polygon}")["name"~"{search_term}", i];(._;>;);'
+                'way(poly:"{polygon}")["name"~"{search_term}", i];(._;>;);'
+                'relation(poly:"{polygon}")["name"~"{search_term}", i];(._;>;);'
                 ');'
                 'out count;'
                 'out;'
             )
-            query_str = query_template.format(polygon=polygon_coord_str, timeout=timeout, maxsize=maxsize)
+            query_str = query_template.format(polygon=polygon_coord_str, search_term=search_term, timeout=timeout, maxsize=maxsize)
             response_json = overpass_request(data={'data':query_str}, timeout=timeout)
             response_jsons.append(response_json)
         msg = ('Got all building footprints data within polygon from API in '
@@ -368,7 +369,11 @@ def create_named_buildings_gdf(polygon=None, north=None, south=None, east=None,
                 if 'tags' in result:
                     building = {'geometry': Point(result['lon'], result['lat'])}
                     building.update(result['tags'])
-                    building.update({'search_term' : search_term})
+
+                    for term in search_term.split('|'):
+                        if re.search(term, result["tags"]["name"], re.IGNORECASE):
+                            building.update({'search_term' : term})
+
                     buildings[result['id']] = building
                 else:
                     vertices[result['id']] = {'lat' : result['lat'],
@@ -383,8 +388,11 @@ def create_named_buildings_gdf(polygon=None, north=None, south=None, east=None,
                 except Exception as e:
                     log('Polygon has invalid geometry: {}'.format(nodes))
                 building = {'nodes' : nodes,
-                            'geometry' : polygon.centroid,
-                            'search_term' : search_term}
+                            'geometry' : polygon.centroid}
+
+                for term in search_term.split('|'):
+                    if re.search(term, result["tags"]["name"], re.IGNORECASE):
+                        building.update({'search_term' : term})
 
                 if 'tags' in result:
                     for tag in result['tags']:
